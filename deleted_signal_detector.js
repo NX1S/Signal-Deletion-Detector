@@ -22,7 +22,7 @@
 const dotenv = require('dotenv');
 const fs = require('fs');
 const path = require('path');
-const Database = require('better-sqlite3');
+const { DatabaseSync } = require('node:sqlite');
 const { TelegramClient } = require('telegram');
 const { StringSession } = require('telegram/sessions/index.js');
 const { NewMessage, Raw } = require('telegram/events/index.js');
@@ -112,8 +112,8 @@ function sanitizeFilename(name) {
 
 // ─── Per-source context: one SQLite file per source ───
 function openSourceDb(title) {
-    const db = new Database(path.join(DB_DIR, `${sanitizeFilename(title)}.db`));
-    db.pragma('journal_mode = WAL');
+    const db = new DatabaseSync(path.join(DB_DIR, `${sanitizeFilename(title)}.db`));
+    db.exec('PRAGMA journal_mode = WAL');
     db.exec(`
         CREATE TABLE IF NOT EXISTS messages (
             message_id   INTEGER PRIMARY KEY,
