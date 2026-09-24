@@ -1,6 +1,9 @@
 {
   "name": "signal-deletion-detector",
   "version": "1.0.0",
+  "engines": {
+    "node": ">=22.5.0"
+  },
   "description": "Detects deleted signals and messages from telegram groups and channels",
   "license": "ISC",
   "author": "Wael Al Hajj",
