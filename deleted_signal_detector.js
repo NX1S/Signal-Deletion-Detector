@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// DELETED SIGNAL DETECTOR v2.0 — FINAL
+// DELETED SIGNAL DETECTOR v2.1
 // Telegram → per-source SQLite + deleted logs
 //
 // HOW IT WORKS
@@ -9,7 +9,12 @@
 //   2. Every incoming text message is cached the moment it arrives.
 //   3. When Telegram reports a deletion, the cached text is recovered by ID
 //      and logged instantly to logs/<source>_deleted.log with the original
-//      post date. Detected rows are kept in the DB (deleted=1) as an archive.
+//     post date. Detected rows are kept in the DB (deleted=1) as an archive.
+//
+// FORWARDED-MESSAGE FILTER (NEW in v2.1)
+//   · Messages forwarded from a DIFFERENT source are never cached.
+//   · Messages forwarded from the SAME channel are cached normally.
+//   · Hidden/anonymous forwards (no fromId) are treated as "different source".
 //
 // NOTES
 //   · Telegram deletion updates carry NO text — the DB is the only source of
@@ -36,6 +41,12 @@ dotenv.config();
 
 const DEBUG = false;        // verbose logging (cached messages, raw updates)
 const SEED_LIMIT = 50;      // messages to snapshot per source at startup
+
+// Forwarded-message filter:
+//   true  → a message forwarded from a DIFFERENT source is skipped (never cached)
+//   same-source forwards are still cached unless ALLOW_SAME_SOURCE_FORWARD = false
+const IGNORE_FORWARDED_FROM_OTHER_SOURCES = true;
+const ALLOW_SAME_SOURCE_FORWARD           = true;
 
 const CONFIG_FILE = 'config.json';
 const DB_DIR = 'db';
@@ -87,6 +98,31 @@ function loadConfig() {
         console.error(`[${getTimestamp()}][CONFIG] Error loading config:`, err.message);
         return defaultConfig;
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FORWARDED-MESSAGE FILTER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Returns true if this message should be SKIPPED because it was forwarded
+// from a different source than the channel it was posted in.
+// Shared by the startup seed and the live message cache.
+function isForwardedFromElsewhere(msg) {
+    if (!IGNORE_FORWARDED_FROM_OTHER_SOURCES || !msg.fwdFrom) return false;
+
+    const fwdPeer = msg.fwdFrom.fromId;
+    let fwdSourceId = null;
+
+    if (fwdPeer) {
+        if (fwdPeer.className === 'PeerChannel') fwdSourceId = fwdPeer.channelId;
+        else if (fwdPeer.className === 'PeerChat') fwdSourceId = fwdPeer.chatId;
+        else if (fwdPeer.className === 'PeerUser') fwdSourceId = fwdPeer.userId; // user ≠ channel → different source
+    }
+
+    // fwdSourceId null (hidden/anonymous forward) → cannot verify origin → treat as different source
+    const sameSource = fwdSourceId != null && normKey(fwdSourceId) === normKey(msg.chatId);
+
+    return !sameSource || !ALLOW_SAME_SOURCE_FORWARD;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -238,6 +274,7 @@ async function seedSource(ctx) {
         let count = 0;
         for (const msg of history) {
             if (!msg.message) continue;
+            if (isForwardedFromElsewhere(msg)) continue;   // ← NEW: don't cache forwards from other sources
             if (insertMessage(ctx, msg.id, msg.message, 'seed')) count++;
         }
         console.log(`[${getTimestamp()}][DETECTOR]   └ seeded ${count} cached message(s)`);
@@ -288,6 +325,12 @@ async function connectTelegram() {
             const msg = event.message;
             if (!msg || !msg.message) return;
             if (!msg.chatId) return;
+
+            // ─── NEW: skip messages forwarded from a different source ───
+            if (isForwardedFromElsewhere(msg)) {
+                if (DEBUG) console.log(`[${getTimestamp()}][CACHE] Skipped forwarded-from-elsewhere message id=${msg.id} in chat ${normKey(msg.chatId)}`);
+                return;
+            }
 
             const key = normKey(msg.chatId);
             let ctx = sources.get(key);
@@ -366,7 +409,7 @@ process.on('SIGTERM', cleanup);
 
 (async () => {
     console.log('╔════════════════════════════════════════════╗');
-    console.log('║     DELETED SIGNAL DETECTOR v2.0           ║');
+    console.log('║     DELETED SIGNAL DETECTOR v2.1           ║');
     console.log('║     Instant deletion recovery              ║');
     console.log('║     Per-source SQLite · logs/ output       ║');
     console.log('╚════════════════════════════════════════════╝\n');
