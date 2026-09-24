@@ -1,0 +1,5 @@
+config.json
+.env
+db/
+logs/
+node_modules/

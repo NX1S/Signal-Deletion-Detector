@@ -1,0 +1,19 @@
+{
+  "name": "signal-deletion-detector",
+  "version": "1.0.0",
+  "description": "Detects deleted signals and messages from telegram groups and channels",
+  "license": "ISC",
+  "author": "Wael Al Hajj",
+  "type": "commonjs",
+  "main": "deleted_signal_detector.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node deleted_signal_detector.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "dotenv": "^18.0.3",
+    "input": "^1.0.1",
+    "telegram": "^2.26.22"
+  }
+}
