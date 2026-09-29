@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// DELETED SIGNAL DETECTOR v2.1
-// Telegram → per-source SQLite + deleted logs
+// DELETED SIGNAL DETECTOR v2.2
+// Telegram → per-source SQLite + deleted logs + live status channel
 //
 // HOW IT WORKS
 //   1. At startup, the most recent messages per source are cached in a
@@ -8,10 +8,10 @@
 //      can still be recovered.
 //   2. Every incoming text message is cached the moment it arrives.
 //   3. When Telegram reports a deletion, the cached text is recovered by ID
-//      and logged instantly to logs/<source>_deleted.log with the original
-//     post date. Detected rows are kept in the DB (deleted=1) as an archive.
+//      and logged instantly to logs/<source>_deleted.log + Telegram channel.
+//      Detected rows are kept in the DB (deleted=1) as an archive.
 //
-// FORWARDED-MESSAGE FILTER (NEW in v2.1)
+// FORWARDED-MESSAGE FILTER
 //   · Messages forwarded from a DIFFERENT source are never cached.
 //   · Messages forwarded from the SAME channel are cached normally.
 //   · Hidden/anonymous forwards (no fromId) are treated as "different source".
@@ -46,14 +46,19 @@ const SEED_LIMIT = 50;      // messages to snapshot per source at startup
 //   true  → a message forwarded from a DIFFERENT source is skipped (never cached)
 //   same-source forwards are still cached unless ALLOW_SAME_SOURCE_FORWARD = false
 const IGNORE_FORWARDED_FROM_OTHER_SOURCES = true;
-const ALLOW_SAME_SOURCE_FORWARD           = true;
+const ALLOW_SAME_SOURCE_FORWARD = true;
+
+// Heartbeat: how often the channel About panel is refreshed.
+// 1 minute is well under Telegram's FloodWait threshold for EditAbout.
+const STATUS_HEARTBEAT_MS = 60 * 1000;
 
 const CONFIG_FILE = 'config.json';
 const DB_DIR = 'db';
 const LOGS_DIR = 'logs';
 
 const defaultConfig = {
-    telegramSources: []     // channel/group IDs or @usernames
+    telegramSources: [],    // channel/group IDs or @usernames
+    logChannel: ''          // channel ID/@username where deletions are posted + status About is maintained
 };
 
 let config = {};
@@ -61,6 +66,13 @@ let telegramClient = null;
 
 // sourceKey (normalized bare id) → { key, entity, title, db }
 const sources = new Map();
+
+// ─── Status channel state ───
+let statusPeer = null;              // resolved InputPeer for the log channel
+let statusLastEditAt = 0;           // last successful About edit (ms)
+let statusFloodWaitUntil = 0;       // skip edits until this timestamp
+let statusLastError = '';
+const processStartedAt = Date.now();
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ID NORMALIZATION — Telegram IDs come in two dialects:
@@ -93,6 +105,10 @@ function loadConfig() {
     try {
         const data = fs.readFileSync(CONFIG_FILE, 'utf8');
         config = { ...defaultConfig, ...JSON.parse(data) };
+        // Allow LOG_CHANNEL env var to override config.json
+        if (process.env.LOG_CHANNEL && !config.logChannel) {
+            config.logChannel = process.env.LOG_CHANNEL;
+        }
         return config;
     } catch (err) {
         console.error(`[${getTimestamp()}][CONFIG] Error loading config:`, err.message);
@@ -196,6 +212,153 @@ function logDeleted(ctx, messageId, text, date) {
     }
     const preview = text.split('\n')[0].substring(0, 60);
     console.log(`[${getTimestamp()}][DETECTOR] 🗑️  ${ctx.title} — deleted id=${messageId}: "${preview}"`);
+
+    // ─── NEW v2.2: also push to the Telegram log channel ───
+    pushDeletedToChannel(ctx, messageId, text, date);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TELEGRAM LOG CHANNEL (v2.2)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Formatting helpers mirroring the Logger example style
+function fmtTimeOnly(date = new Date()) {
+    const hours = date.getHours();
+    const minutes = String(date.getMinutes()).padStart(2, '0');
+    const subscripts = ['₀', '₁', '₂', '₃', '₄', '₅', '₆', '₇', '₈', '₉'];
+    const seconds = String(date.getSeconds())
+        .padStart(2, '0')
+        .replace(/\d/g, d => subscripts[d]);
+    return `${hours}:${minutes}:${seconds}`;
+}
+
+// yyyy-mm-dd hh:mm (24h) — used for the status panel's Last Active line
+function fmtDateTime(date = new Date()) {
+    const yyyy = date.getFullYear();
+    const mm = String(date.getMonth() + 1).padStart(2, '0');
+    const dd = String(date.getDate()).padStart(2, '0');
+    const hh = String(date.getHours()).padStart(2, '0');
+    const mi = String(date.getMinutes()).padStart(2, '0');
+    return `${yyyy}-${mm}-${dd} ${hh}:${mi}`;
+}
+
+function formatUptime(ms) {
+    const totalSec = Math.floor(ms / 1000);
+    const d = Math.floor(totalSec / 86400);
+    const h = Math.floor((totalSec % 86400) / 3600);
+    const m = Math.floor((totalSec % 3600) / 60);
+    const s = totalSec % 60;
+    const pad = n => String(n).padStart(2, '0');
+    return `${pad(d)}d ${pad(h)}h ${pad(m)}m ${pad(s)}s`;
+}
+
+async function resolveLogChannel() {
+    if (!config.logChannel) {
+        console.log(`[${getTimestamp()}][STATUS] No logChannel configured — Telegram logging disabled (set LOG_CHANNEL or config.logChannel)`);
+        return;
+    }
+    try {
+        statusPeer = await telegramClient.getInputEntity(config.logChannel);
+        console.log(`[${getTimestamp()}][STATUS] Log channel: ${config.logChannel}`);
+    } catch (err) {
+        console.error(`[${getTimestamp()}][STATUS] Could not resolve log channel '${config.logChannel}':`, err.message);
+        statusPeer = null;
+    }
+}
+
+// Post a recovered deleted message to the log channel
+async function pushDeletedToChannel(ctx, messageId, text, date) {
+    if (!statusPeer) return;
+
+    const truncated = text.length > 3500 ? text.substring(0, 3500) + '\n\n…[truncated]' : text;
+    const message =
+        `🗑️ **DELETED MESSAGE DETECTED**\n` +
+        `→ Source: ${ctx.title}\n` +
+        `→ Message ID: ${messageId}\n` +
+        `→ Originally posted: ${date}\n\n` +
+        `${truncated}\n\n` +
+        `@ ${fmtTimeOnly()}`;
+
+    try {
+        await telegramClient.sendMessage(statusPeer, { message });
+    } catch (err) {
+        console.error(`[${getTimestamp()}][ERROR] Failed to post deletion to log channel:`, err.message);
+    }
+}
+
+// ─── Live status panel: channel About (description) heartbeat ───
+const ABOUT_MAX_LEN = 255;   // Telegram channel description hard limit
+
+function buildStatusAbout() {
+    const onOff = v => v ? 'on' : 'off';
+
+    const base = () =>
+        `SIGNAL DELETION DETECTOR\n` +
+        (statusLastError ? `⚠️ ${statusLastError}\n` : '') +
+        `Last Active: ${fmtDateTime()}\n` +
+        `Sources: ${sources.size}\n` +
+        `DEBUG=${onOff(DEBUG)} · Seed=${SEED_LIMIT} · Forward Filter=${onOff(IGNORE_FORWARDED_FROM_OTHER_SOURCES)}`;
+
+    let about = base();
+    if (about.length > ABOUT_MAX_LEN) {
+        about = about.slice(0, ABOUT_MAX_LEN - 1) + '…';
+    }
+    return about;
+}
+
+function getEditAboutCtor() {
+    const msgs = Api.messages || {};
+    const chans = Api.channels || {};
+    return msgs.EditChatAbout || msgs.editChatAbout ||
+        chans.EditAbout || chans.editAbout || null;
+}
+
+let editAboutLoggedMissing = false;
+
+async function updateStatusAbout() {
+    if (!statusPeer) return;
+    if (Date.now() < statusFloodWaitUntil) return;   // Telegram told us to wait
+
+    const EditAbout = getEditAboutCtor();
+    if (!EditAbout) {
+        if (!editAboutLoggedMissing) {
+            console.error(`[${getTimestamp()}][ERROR] No EditChatAbout/EditAbout constructor found. ` +
+                `Try updating gramJS: npm i telegram@latest`);
+            editAboutLoggedMissing = true;
+        }
+        return;
+    }
+
+    const about = buildStatusAbout();
+    try {
+        await telegramClient.invoke(
+            new EditAbout({ peer: statusPeer, about })
+        );
+        statusLastEditAt = Date.now();
+        statusLastError = '';
+    } catch (err) {
+        // FloodWait (420) → back off for the requested duration
+        if (err && err.code === 420 && err.seconds) {
+            statusFloodWaitUntil = Date.now() + err.seconds * 1000;
+            statusLastError = `FloodWait ${err.seconds}s`;
+            if (DEBUG) console.log(`[${getTimestamp()}][STATUS] FloodWait — pausing About edits for ${err.seconds}s`);
+        } else if (err && err.errorMessage === 'CHAT_ABOUT_NOT_MODIFIED') {
+            statusLastEditAt = Date.now();   // text unchanged — still alive
+        } else {
+            statusLastError = err.message;
+            console.error(`[${getTimestamp()}][ERROR] Status About update failed:`, err.message);
+        }
+    }
+}
+
+let statusHeartbeatTimer = null;
+
+function startStatusHeartbeat() {
+    if (!config.logChannel) return;
+    statusHeartbeatTimer = setInterval(() => {
+        updateStatusAbout().catch(() => { });
+    }, STATUS_HEARTBEAT_MS);
+    console.log(`[${getTimestamp()}][STATUS] Heartbeat started (${STATUS_HEARTBEAT_MS}ms interval)`);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -274,7 +437,7 @@ async function seedSource(ctx) {
         let count = 0;
         for (const msg of history) {
             if (!msg.message) continue;
-            if (isForwardedFromElsewhere(msg)) continue;   // ← NEW: don't cache forwards from other sources
+            if (isForwardedFromElsewhere(msg)) continue;
             if (insertMessage(ctx, msg.id, msg.message, 'seed')) count++;
         }
         console.log(`[${getTimestamp()}][DETECTOR]   └ seeded ${count} cached message(s)`);
@@ -309,6 +472,9 @@ async function connectTelegram() {
         const me = await telegramClient.getMe();
         console.log(`[${getTimestamp()}][TELEGRAM] ✅ Connected as @${me.username || me.firstName}`);
 
+        // ─── Resolve log channel BEFORE seeding (so deletions can be posted) ───
+        await resolveLogChannel();
+
         // ─── Register configured sources & seed recent history ───
         for (const src of config.telegramSources) {
             const resolved = await resolveSourceName(src);
@@ -326,7 +492,6 @@ async function connectTelegram() {
             if (!msg || !msg.message) return;
             if (!msg.chatId) return;
 
-            // ─── NEW: skip messages forwarded from a different source ───
             if (isForwardedFromElsewhere(msg)) {
                 if (DEBUG) console.log(`[${getTimestamp()}][CACHE] Skipped forwarded-from-elsewhere message id=${msg.id} in chat ${normKey(msg.chatId)}`);
                 return;
@@ -370,6 +535,9 @@ async function connectTelegram() {
 
         console.log(`[${getTimestamp()}][DETECTOR] Watching ${sources.size} source(s) — instant mode, no polling.`);
 
+        // ─── Start the channel-description heartbeat ───
+        startStatusHeartbeat();
+
     } catch (err) {
         console.error(`[${getTimestamp()}][TELEGRAM] Connection failed:`, err.message);
         setTimeout(connectTelegram, 10000);
@@ -395,6 +563,7 @@ function getTimestamp(date = new Date()) {
 
 function cleanup() {
     console.log(`\n[${getTimestamp()}][SYSTEM] Shutting down gracefully...`);
+    if (statusHeartbeatTimer) clearInterval(statusHeartbeatTimer);
     for (const ctx of sources.values()) ctx.db.close();
     if (telegramClient) telegramClient.disconnect();
     process.exit(0);
@@ -409,7 +578,7 @@ process.on('SIGTERM', cleanup);
 
 (async () => {
     console.log('╔════════════════════════════════════════════╗');
-    console.log('║     DELETED SIGNAL DETECTOR v2.1           ║');
+    console.log('║     DELETED SIGNAL DETECTOR v2.2           ║');
     console.log('║     Instant deletion recovery              ║');
     console.log('║     Per-source SQLite · logs/ output       ║');
     console.log('╚════════════════════════════════════════════╝\n');
@@ -418,7 +587,8 @@ process.on('SIGTERM', cleanup);
     loadConfig();
     ensureDirs();
 
-    console.log(`[${getTimestamp()}][SYSTEM] Sources configured: ${config.telegramSources.length}\n`);
+    console.log(`[${getTimestamp()}][SYSTEM] Sources configured: ${config.telegramSources.length}`);
+    console.log(`[${getTimestamp()}][SYSTEM] Log channel: ${config.logChannel || '(not set — Telegram logging disabled)'}\n`);
 
     await connectTelegram();
 
